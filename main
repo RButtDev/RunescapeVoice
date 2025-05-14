@@ -2,13 +2,113 @@ from PIL import Image, ImageGrab, ImageEnhance, ImageFilter
 import pytesseract
 import time
 import numpy as np
-from elevenlabs.client import ElevenLabs
-from elevenlabs import play
+from kokoro import KPipeline
+import soundfile as sf
+import pygame
+import os
+import tempfile
+import torch
+import json
+import tkinter as tk
+from tkinter import messagebox
+import sys
+import traceback
 
-# Properly scaled region for the dialog - MUST BE RECALIBRATED
-DIALOG_BOX_REGION = (702, 738, 1215, 878)  # Just an example, not your actual coordinates
+# File to save/load screen coordinates
+COORDS_FILE = "dialog_box_coords.json"
 
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+def select_screen_region():
+    """Allow user to select screen region and return coordinates"""
+    root = tk.Tk()
+    root.title("Select Dialog Region")
+    root.attributes('-alpha', 0.9)
+
+    label = tk.Label(root,
+                     text="Click 'Start Selection' then click the top-left and bottom-right corners of the dialog box")
+    label.pack(pady=10)
+
+    result_coords = []
+    selection_active = False
+    status_label = tk.Label(root, text="Ready to select")
+    status_label.pack(pady=5)
+
+    def start_selection():
+        nonlocal selection_active
+        selection_active = True
+        root.iconify()  # Minimize main window
+        overlay = tk.Toplevel(root)
+        overlay.attributes('-fullscreen', True)
+        overlay.attributes('-alpha', 0.3)
+        overlay.configure(bg='lightblue')
+
+        instruction = tk.Label(overlay, text="Click top-left corner", font=("Arial", 24), bg="lightblue")
+        instruction.pack(pady=20)
+
+        def on_click(event):
+            nonlocal result_coords
+            result_coords.append((event.x, event.y))
+            if len(result_coords) == 1:
+                instruction.config(text="Now click bottom-right corner")
+            else:
+                overlay.destroy()
+                root.deiconify()  # Restore main window
+                status_label.config(text=f"Selected: {result_coords[0]} to {result_coords[1]}")
+                save_btn.config(state=tk.NORMAL)
+
+        overlay.bind("<Button-1>", on_click)
+
+    def save_and_close():
+        if len(result_coords) == 2:
+            x1, y1 = result_coords[0]
+            x2, y2 = result_coords[1]
+            final_coords = (x1, y1, x2, y2)
+            save_coordinates(final_coords)
+            root.destroy()
+
+    start_btn = tk.Button(root, text="Start Selection", command=start_selection)
+    start_btn.pack(pady=10)
+
+    save_btn = tk.Button(root, text="Save and Continue", command=save_and_close, state=tk.DISABLED)
+    save_btn.pack(pady=10)
+
+    root.mainloop()
+
+    if len(result_coords) == 2:
+        x1, y1 = result_coords[0]
+        x2, y2 = result_coords[1]
+        return (x1, y1, x2, y2)
+
+    return None
+
+
+def save_coordinates(coords):
+    """Save coordinates to file"""
+    try:
+        with open(COORDS_FILE, 'w') as f:
+            json.dump(coords, f)
+        print(f"Dialog box coordinates saved: {coords}")
+        return True
+    except Exception as e:
+        print(f"Error saving coordinates: {e}")
+        return False
+
+
+def load_coordinates():
+    """Load coordinates from file or return None if file doesn't exist"""
+    try:
+        with open(COORDS_FILE, 'r') as f:
+            coords = json.load(f)
+        print(f"Loaded dialog box coordinates: {coords}")
+        return tuple(coords)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        print(f"No saved coordinates found: {e}")
+        return None
+    except Exception as e:
+        print(f"Error loading coordinates: {e}")
+        return None
+
+
 def advanced_preprocessing(image):
     # Upscale by 2x to improve OCR (effective DPI increase)
     width, height = image.size
@@ -27,45 +127,143 @@ def advanced_preprocessing(image):
     return image.point(lambda x: 0 if x < 140 else 255)
 
 
-# Initialize client correctly
-client = ElevenLabs(api_key="sk_41acac3a6692916724c9e103b645aba199f069daab1a77a8")
-VOICE_ID = "21m00Tcm4TlvDq8ikWAM"  # Actual voice ID, not name
-
-previous_text = ""
-debounce_time = 2.5
-
-while True:
+def play_audio(audio, sample_rate=24000):
     try:
-        screenshot = ImageGrab.grab(bbox=DIALOG_BOX_REGION)
-        screenshot.save("original.png")  # Debug original capture
+        # Create a unique temporary file in the system's temp directory
+        temp_dir = tempfile.gettempdir()
+        temp_file = os.path.join(temp_dir, f"speech_{time.time()}.wav")
 
-        processed_img = advanced_preprocessing(screenshot)
-        processed_img.save("processed.png")  # Debug processed image
+        # Convert PyTorch tensor to NumPy array if needed
+        if isinstance(audio, torch.Tensor):
+            audio = audio.detach().cpu().numpy()
 
-        # Use better OCR settings for game text
-        text = pytesseract.image_to_string(
-            processed_img,
-            config='--psm 6 --oem 3 -l eng -c tessedit_char_blacklist=|~`$#^*_[] -c page_separator=""'
-        ).strip().replace('\n', ' ')
+        # Ensure audio is in the correct format (float32 between -1 and 1)
+        audio = audio.astype(np.float32)
 
-        if text and text != previous_text:
-            print(f"NPC Says: {text}")
+        # Normalize audio if needed
+        if np.max(np.abs(audio)) > 1.0:
+            audio = audio / np.max(np.abs(audio))
 
-            # CORRECT API call pattern
-            audio = client.text_to_speech.convert(
-                text=text,
-                voice_id=VOICE_ID,
-                model_id="eleven_monolingual_v1"
-            )
-            play(audio)
+        # Write the audio file
+        sf.write(temp_file, audio, sample_rate)
 
-            previous_text = text
-            time.sleep(debounce_time)
-        else:
-            time.sleep(0.3)
+        # Play the audio
+        pygame.mixer.music.load(temp_file)
+        pygame.mixer.music.play()
 
-    except KeyboardInterrupt:
-        break
+        # Wait for playback to finish
+        while pygame.mixer.music.get_busy():
+            pygame.time.Clock().tick(10)
+
+        # Clean up the temporary file after playback
+        try:
+            os.remove(temp_file)
+        except:
+            pass  # It's fine if cleanup fails
+
     except Exception as e:
-        print(f"Error: {e}")
-        time.sleep(1)
+        print(f"Audio playback error: {e}")
+
+
+# Define the main application in a class structure
+class DialogReader:
+    def __init__(self):
+        self.dialog_box_region = None
+        self.pipeline = None
+        self.previous_text = ""
+        self.debounce_time = 2.5
+
+        # Set Tesseract path
+        pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+        # Initialize pygame for audio
+        pygame.mixer.init(frequency=24000)
+
+    def initialize(self):
+        print("Initializing Dialog Reader...")
+
+        # Get dialog box region
+        self.dialog_box_region = load_coordinates()
+        if self.dialog_box_region is None:
+            print("No saved coordinates found. Starting selection process...")
+            self.dialog_box_region = select_screen_region()
+            if not self.dialog_box_region:
+                print("Failed to select region. Using default values.")
+                self.dialog_box_region = (702, 738, 1215, 878)  # Default fallback
+
+        print(f"Using dialog box region: {self.dialog_box_region}")
+
+        # Initialize TTS pipeline
+        print("Initializing Kokoro TTS pipeline...")
+        try:
+            self.pipeline = KPipeline(lang_code='a')
+            print("TTS pipeline initialized successfully.")
+        except Exception as e:
+            print(f"Error initializing TTS pipeline: {e}")
+            traceback.print_exc()
+            return False
+
+        return True
+
+    def run(self):
+        if not self.initialize():
+            print("Initialization failed. Exiting.")
+            return
+
+        print("\n=== Dialog Reader Started ===")
+        print(f"Monitoring region: {self.dialog_box_region}")
+        print("Press Ctrl+C to exit\n")
+
+        try:
+            self._main_loop()
+        except KeyboardInterrupt:
+            print("\nProgram terminated by user.")
+        except Exception as e:
+            print(f"\nUnexpected error: {e}")
+            traceback.print_exc()
+
+    def _main_loop(self):
+        while True:
+            try:
+                # Capture and process screenshot
+                screenshot = ImageGrab.grab(bbox=self.dialog_box_region)
+                screenshot.save("original.png")
+
+                processed_img = advanced_preprocessing(screenshot)
+                processed_img.save("processed.png")
+
+                # Extract text with OCR
+                text = pytesseract.image_to_string(
+                    processed_img,
+                    config='--psm 6 --oem 3 -l eng -c tessedit_char_blacklist=|~`$#^*_[] -c page_separator=""'
+                ).strip().replace('\n', ' ')
+
+                # Process text if changed
+                if text and text != self.previous_text:
+                    print(f"NPC Says: {text}")
+
+                    # Generate and play audio
+                    generator = self.pipeline(text, voice='af_heart')
+                    for i, (gs, ps, audio) in enumerate(generator):
+                        if i == 0:  # Just play the first audio segment
+                            play_audio(audio)
+                            break
+
+                    self.previous_text = text
+                    time.sleep(self.debounce_time)
+                else:
+                    time.sleep(0.3)
+
+            except Exception as e:
+                print(f"Error in main loop: {e}")
+                time.sleep(1)
+
+
+if __name__ == "__main__":
+    try:
+        reader = DialogReader()
+        reader.run()
+    except Exception as e:
+        print(f"Critical error: {e}")
+        traceback.print_exc()
+        input("\nPress Enter to exit...")
