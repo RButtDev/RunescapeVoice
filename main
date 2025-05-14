@@ -1,0 +1,71 @@
+from PIL import Image, ImageGrab, ImageEnhance, ImageFilter
+import pytesseract
+import time
+import numpy as np
+from elevenlabs.client import ElevenLabs
+from elevenlabs import play
+
+# Properly scaled region for the dialog - MUST BE RECALIBRATED
+DIALOG_BOX_REGION = (702, 738, 1215, 878)  # Just an example, not your actual coordinates
+
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+def advanced_preprocessing(image):
+    # Upscale by 2x to improve OCR (effective DPI increase)
+    width, height = image.size
+    image = image.resize((width * 2, height * 2), Image.LANCZOS)
+
+    # High contrast for text separation
+    image = ImageEnhance.Contrast(image).enhance(2.5)
+
+    # Sharpen to improve edge definition
+    image = image.filter(ImageFilter.SHARPEN)
+
+    # Convert to grayscale
+    image = image.convert('L')
+
+    # Adaptive thresholding - better than simple threshold
+    return image.point(lambda x: 0 if x < 140 else 255)
+
+
+# Initialize client correctly
+client = ElevenLabs(api_key="sk_41acac3a6692916724c9e103b645aba199f069daab1a77a8")
+VOICE_ID = "21m00Tcm4TlvDq8ikWAM"  # Actual voice ID, not name
+
+previous_text = ""
+debounce_time = 2.5
+
+while True:
+    try:
+        screenshot = ImageGrab.grab(bbox=DIALOG_BOX_REGION)
+        screenshot.save("original.png")  # Debug original capture
+
+        processed_img = advanced_preprocessing(screenshot)
+        processed_img.save("processed.png")  # Debug processed image
+
+        # Use better OCR settings for game text
+        text = pytesseract.image_to_string(
+            processed_img,
+            config='--psm 6 --oem 3 -l eng -c tessedit_char_blacklist=|~`$#^*_[] -c page_separator=""'
+        ).strip().replace('\n', ' ')
+
+        if text and text != previous_text:
+            print(f"NPC Says: {text}")
+
+            # CORRECT API call pattern
+            audio = client.text_to_speech.convert(
+                text=text,
+                voice_id=VOICE_ID,
+                model_id="eleven_monolingual_v1"
+            )
+            play(audio)
+
+            previous_text = text
+            time.sleep(debounce_time)
+        else:
+            time.sleep(0.3)
+
+    except KeyboardInterrupt:
+        break
+    except Exception as e:
+        print(f"Error: {e}")
+        time.sleep(1)
